@@ -25,13 +25,15 @@ jobs:
           last_tag=$(git tag --list 'v*' --sort=-version:refname | head -n1)
           if [ -z "$last_tag" ]; then
             base="0.0.0"
-            range="HEAD~1..HEAD"
+            if git rev-parse HEAD~1 >/dev/null 2>&1; then
+              commits=$(git log --format=%s HEAD~1..HEAD)
+            else
+              commits=$(git log --format=%s -1 HEAD)
+            fi
           else
             base=${last_tag#v}
-            range="$last_tag..HEAD"
+            commits=$(git log --format=%s $last_tag..HEAD)
           fi
-
-          commits=$(git log --format=%s $range)
           bump=none
           if echo "$commits" | grep -Eq 'BREAKING CHANGE|!:'; then
             bump=major
