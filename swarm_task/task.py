@@ -3,7 +3,6 @@ from inspect import iscoroutinefunction
 from typing import Awaitable, Callable, Generic, List, Optional, Union, cast
 
 from .core.context import EvaluationContext
-from .core.exceptions import SwarmTaskError
 from .core.results import EvaluationResult, TaskResult
 from .core.types import SwarmTaskType, T
 from .evaluators.base import BaseEvaluator, MaxRetriesExceededError
@@ -55,35 +54,7 @@ class SwarmTask(Generic[T]):
     ) -> TaskResult[T]:
         """Execute the task with evaluation and optimization."""
         logger.info("Running SwarmTask")
-
-        try:
-            return await self._run(task_fn, context)
-        except SwarmTaskError as e:
-            # Handle known errors
-            logger.error(
-                "SwarmTask failed",
-                extra={"error_type": type(e).__name__, "error_message": str(e)},
-            )
-            return TaskResult(
-                result=cast(T, None),
-                success=False,
-                total_attempts=context.total_attempts if context else 0,
-                history=context.history if context else [],
-                metadata={"error_type": type(e).__name__, "error_message": str(e)},
-            )
-        except Exception as e:
-            # Handle unexpected errors
-            logger.error(
-                "SwarmTask failed",
-                extra={"error_type": "UnexpectedError", "error_message": str(e)},
-            )
-            return TaskResult(
-                result=cast(T, None),
-                success=False,
-                total_attempts=context.total_attempts if context else 1,
-                history=context.history if context else [],
-                metadata={"error_type": "UnexpectedError", "error_message": str(e)},
-            )
+        return await self._run(task_fn, context)
 
     async def _run(
         self,
@@ -101,34 +72,56 @@ class SwarmTask(Generic[T]):
             TaskResult containing final result and execution history
         """
         context = context or EvaluationContext[T]()
-        total_attempts = 0
+        task_attempts = 0
         max_total_attempts = max(e.max_retries for e in self.evaluators) + 1
+        last_result: Optional[T] = None
 
-        while total_attempts < max_total_attempts:
-            total_attempts += 1
-            logger.info(f"Attempt {total_attempts} of {max_total_attempts}")
+        def build_failure_result(
+            result: T,
+            reason: str,
+            **metadata: object,
+        ) -> TaskResult[T]:
+            failure_metadata = {"reason": reason, **metadata}
+            logger.error("SwarmTask failed", extra=failure_metadata)
+            return TaskResult(
+                result=result,
+                success=False,
+                total_attempts=max(1, task_attempts),
+                history=context.history,
+                metadata=failure_metadata,
+            )
+
+        while task_attempts < max_total_attempts:
+            task_attempts += 1
+            logger.info("Attempt %s of %s", task_attempts, max_total_attempts)
 
             logger.debug("Task fn %s", task_fn)
 
-            # Handle both async and sync functions
-            result = cast(
-                T, await task_fn() if iscoroutinefunction(task_fn) else task_fn()
-            )
+            try:
+                result = cast(
+                    T, await task_fn() if iscoroutinefunction(task_fn) else task_fn()
+                )
+            except Exception as error:
+                if last_result is None:
+                    raise
+                return build_failure_result(
+                    last_result,
+                    "Task function failed",
+                    error_type=type(error).__name__,
+                    error_message=str(error),
+                )
 
+            last_result = result
             logger.debug("Result %s", result)
 
-            # Run through all evaluators
             success = True
             for evaluator in self.evaluators:
                 try:
-                    evaluation_result = await evaluator(
-                        result, context
-                    )  # Use __call__ to track retries
+                    evaluation_result = await evaluator(result, context)
                     logger.debug("Evaluation result %s", evaluation_result)
 
                     if not evaluation_result.success:
                         success = False
-                        # Get improvement prompt and add to context
                         improvement_prompt = await evaluator.get_improvement_prompt(
                             result, evaluation_result, context
                         )
@@ -138,9 +131,8 @@ class SwarmTask(Generic[T]):
                             evaluation_result=evaluation_result,
                             improvement_prompt=improvement_prompt,
                         )
-                        break  # Move to next attempt
+                        break
 
-                    # Add successful attempt to context
                     context.add_attempt(
                         result=result,
                         evaluator_name=evaluator.name,
@@ -148,37 +140,34 @@ class SwarmTask(Generic[T]):
                     )
 
                 except MaxRetriesExceededError:
-                    return TaskResult(
+                    return build_failure_result(
                         result=result,
-                        success=False,
-                        total_attempts=context.total_attempts,
-                        history=context.history,
-                        metadata={
-                            "failed_evaluator": evaluator.name,
-                            "reason": "Max retries exceeded",
-                        },
+                        reason="Max retries exceeded",
+                        failed_evaluator=evaluator.name,
+                    )
+                except Exception as error:
+                    return build_failure_result(
+                        result=result,
+                        reason="Evaluation pipeline failed",
+                        failed_evaluator=evaluator.name,
+                        error_type=type(error).__name__,
+                        error_message=str(error),
                     )
 
-            # If all evaluators passed, we're done
             if success:
                 return TaskResult(
                     result=result,
                     success=True,
-                    total_attempts=context.total_attempts,
+                    total_attempts=max(1, task_attempts),
                     history=context.history,
                     metadata={"final_evaluator": self.evaluators[-1].name},
                 )
 
-        # If we get here, we've exceeded total attempts
-        return TaskResult(
-            result=result,
-            success=False,
-            total_attempts=context.total_attempts,
-            history=context.history,
-            metadata={
-                "reason": "Maximum total attempts exceeded",
-                "max_attempts": max_total_attempts,
-            },
+        assert last_result is not None
+        return build_failure_result(
+            last_result,
+            "Maximum total attempts exceeded",
+            max_attempts=max_total_attempts,
         )
 
     @property
