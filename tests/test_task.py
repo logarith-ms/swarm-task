@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 
 from swarm_task.core.context import EvaluationContext
@@ -8,6 +10,24 @@ from swarm_task.evaluators import PassthroughEvaluator
 from swarm_task.evaluators.custom import CustomEvaluator
 from swarm_task.evaluators.schema import SchemaValidator
 from swarm_task.task import SwarmTask, SwarmTaskType
+
+
+def test_swarm_task_init_does_not_overwrite_reserved_logrecord_fields(caplog):
+    """Debug logging during initialization should not use reserved LogRecord keys."""
+    caplog.set_level(logging.DEBUG, logger="swarm_task")
+
+    task = SwarmTask(
+        type=SwarmTaskType.EVALUATOR_OPTIMIZER,
+        evaluators=[PassthroughEvaluator()],
+        name="StyleContentTask",
+    )
+
+    assert task.name == "StyleContentTask"
+    assert any(
+        getattr(record, "task_name", None) == "StyleContentTask"
+        for record in caplog.records
+        if record.name == "swarm_task"
+    )
 
 
 async def test_swarm_task_successful_run(test_schema, valid_test_data):
