@@ -43,7 +43,7 @@ class SwarmTask(Generic[T]):
             extra={
                 "type": self.type,
                 "evaluators": self.evaluator_names,
-                "name": self.name,
+                "task_name": self.name,
             },
         )
 
